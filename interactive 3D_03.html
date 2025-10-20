@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Cutting List</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <style>
+    body { font-family: Arial, Helvetica, sans-serif; background: #f3f4f6; padding: 20px; }
+    .grid { display: grid; grid-template-columns: 1fr 420px; gap: 20px; align-items:start; }
+    table { width: 100%; border-collapse: collapse; margin-bottom: 1rem; table-layout:fixed; }
+    th, td { border: 1px solid #ccc; padding: 6px; text-align: center; overflow:hidden; }
+    th { background: #e5e7eb; font-size:13px; }
+    input { width: 100%; box-sizing: border-box; padding:6px; }
+    button { margin: 5px; padding: 8px 10px; border: none; border-radius: 5px; background: #2563eb; color: white; cursor: pointer; }
+    button:hover { background: #1d4ed8; }
+    .small { padding:6px 8px; font-size:13px; }
+
+    .preview-card { background: white; border-radius: 8px; padding: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+    .preview-header { font-weight: 700; margin-bottom: 8px; display:flex; justify-content:space-between; align-items:center; }
+    .scene { width: 100%; height: 360px; display:flex; align-items:center; justify-content:center; perspective: 900px; cursor: grab; overflow:hidden; }
+    .box-wrapper { transform-style: preserve-3d; transition: transform 120ms linear; width: 340px; height: 340px; display:flex; align-items:center; justify-content:center; }
+    .box { position: relative; transform-style: preserve-3d; }
+    .face { position: absolute; box-sizing: border-box; backface-visibility: hidden; border: 1px solid rgba(0,0,0,0.12); background: linear-gradient(180deg,#ffffff,#eeeeee); display:flex; align-items:center; justify-content:center; font-size:12px; }
+
+    /* face transforms use CSS variables set in JS */
+    .face.front  { transform: translateZ(var(--depth-half)); }
+    .face.back   { transform: rotateY(180deg) translateZ(var(--depth-half)); }
+    .face.right  { transform: rotateY(90deg) translateZ(var(--length-half)); }
+    .face.left   { transform: rotateY(-90deg) translateZ(var(--length-half)); }
+    .face.top    { transform: rotateX(90deg) translateZ(var(--width-half)); }
+    .face.bottom { transform: rotateX(-90deg) translateZ(var(--width-half)); }
+
+    .meta { margin-top: 8px; font-size: 13px; color: #374151; }
+    tr.selected { background: #eef2ff; }
+    .legend { margin-top:8px; display:flex; flex-direction:column; gap:6px; }
+    .legend-item { display:flex; align-items:center; gap:8px; }
+    .color-box { width:18px; height:14px; border-radius:3px; border:1px solid rgba(0,0,0,0.12); }
+
+    @media (max-width:900px){ .grid{grid-template-columns:1fr;} .scene{height:300px} }
+  </style>
+</head>
+<body>
+  <h1>Cutting List</h1>
+  <div class="grid">
+    <div>
+      <table id="cuttingList">
+        <thead>
+          <tr>
+            <th style="width:120px">Material</th>
+            <th style="width:80px">Length (mm)</th>
+            <th style="width:80px">Width (mm)</th>
+            <th style="width:80px">Thickness (mm)</th>
+            <th style="width:80px">Edge 1</th>
+            <th style="width:80px">Edge 2</th>
+            <th style="width:80px">Edge 3</th>
+            <th style="width:80px">Edge 4</th>
+            <th style="width:70px">Preview</th>
+            <th style="width:70px">Action</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <div>
+        <button class="small" onclick="addRow()">Add Row</button>
+        <button class="small" onclick="exportCSV()">Export CSV</button>
+        <button class="small" onclick="exportExcel()">Export Excel</button>
+      </div>
+    </div>
+
+    <div class="preview-card">
+      <div class="preview-header">
+        <div>3D Preview</div>
+        <div id="legendContainer" style="font-size:13px"></div>
+      </div>
+      <div class="scene" id="scene">
+        <div class="box-wrapper" id="boxWrapper" style="transform: rotateX(20deg) rotateY(-20deg) scale(1);">
+          <div class="box" id="box" style="--length-half:50px; --width-half:30px; --depth-half:10px;">
+            <div class="face front" data-face="front"></div>
+            <div class="face back" data-face="back"></div>
+            <div class="face right" data-face="right"></div>
+            <div class="face left" data-face="left"></div>
+            <div class="face top" data-face="top"></div>
+            <div class="face bottom" data-face="bottom"></div>
+          </div>
+        </div>
+      </div>
+      <div class="meta" id="previewMeta">No selection</div>
+      <div class="legend" id="materialLegend"></div>
+    </div>
+  </div>
+
+  <script>
+    // Utility: safe parse float
+    const parseF = v => { const n = parseFloat(v); return isNaN(n) ? 0 : n; };
+
+    const materialColorsDefault = {
+      'mdf': '#b07a4b',
+      'plywood': '#d9c9b1',
+      'veneer': '#deb887',
+      'chipboard': '#c0a080',
+      'default': '#9ca3af'
+    };
+
+    const tableBody = document.querySelector('#cuttingList tbody');
+    const box = document.getElementById('box');
+    const scene = document.getElementById('scene');
+    const boxWrapper = document.getElementById('boxWrapper');
+    const previewMeta = document.getElementById('previewMeta');
+    const materialLegend = document.getElementById('materialLegend');
+
+    let selectedIndex = -1;
+
+    function addRow(material = '', length = '', width = '', thickness = '', e1 = '', e2 = '', e3 = '', e4 = '') {
+      const index = tableBody.querySelectorAll('tr').length;
+      const tr = document.createElement('tr');
+      tr.dataset.index = index;
+
+      tr.innerHTML = `
+        <td><input class='material' placeholder='Material' value='${material}'></td>
+        <td><input class='len' type='number' placeholder='Length' value='${length}'></td>
+        <td><input class='wid' type='number' placeholder='Width' value='${width}'></td>
+        <td><input class='thk' type='number' placeholder='Thickness' value='${thickness}'></td>
+        <td><input class='e1' placeholder='Edge 1' value='${e1}'></td>
+        <td><input class='e2' placeholder='Edge 2' value='${e2}'></td>
+        <td><input class='e3' placeholder='Edge 3' value='${e3}'></td>
+        <td><input class='e4' placeholder='Edge 4' value='${e4}'></td>
+        <td><button class='preview small'>Preview</button></td>
+        <td><button class='del small' style='background:#dc2626'>Delete</button></td>
+      `;
+
+      // wire events
+      tr.querySelector('.preview').addEventListener('click', () => selectRow(index));
+      tr.querySelector('.del').addEventListener('click', (e) => { e.stopPropagation(); tr.remove(); renumberRows(); rebuildLegend(); if (selectedIndex==index) clearSelection(); else if (selectedIndex>index) selectedIndex--; });
+      tr.querySelectorAll('input').forEach(inp => inp.addEventListener('input', () => { if (Number(tr.dataset.index) === selectedIndex) updatePreviewFromRow(tr); rebuildLegend(); }));
+
+      tableBody.appendChild(tr);
+      renumberRows();
+      rebuildLegend();
+    }
+
+    function renumberRows(){ tableBody.querySelectorAll('tr').forEach((tr,i)=>tr.dataset.index=i); }
+
+    function selectRow(i){
+      const rows = Array.from(tableBody.querySelectorAll('tr'));
+      rows.forEach(r=>r.classList.remove('selected'));
+      const row = rows[i];
+      if(!row){ clearSelection(); return; }
+      row.classList.add('selected'); selectedIndex=i; updatePreviewFromRow(row);
+    }
+
+    function clearSelection(){ selectedIndex=-1; previewMeta.textContent='No selection'; setBoxDimensions(100,60,10); }
+
+    function updatePreviewFromRow(row){
+      const mat = (row.querySelector('.material').value || '').trim();
+      const len = parseF(row.querySelector('.len').value);
+      const wid = parseF(row.querySelector('.wid').value);
+      const thk = parseF(row.querySelector('.thk').value);
+      const e1 = row.querySelector('.e1').value.trim();
+      const e2 = row.querySelector('.e2').value.trim();
+      const e3 = row.querySelector('.e3').value.trim();
+      const e4 = row.querySelector('.e4').value.trim();
+
+      previewMeta.textContent = `Material: ${mat || '—'} | ${len} x ${wid} x ${thk} mm`;
+      setBoxDimensions(len || 1, wid || 1, thk || 1);
+
+      // color mapping
+      const color = getColorForMaterial(mat);
+
+      // highlight faces if corresponding edge values are numeric
+      // Edge1 -> front, Edge2 -> right, Edge3 -> back, Edge4 -> left
+      const faces = {
+        front: box.querySelector('.face.front'),
+        right: box.querySelector('.face.right'),
+        back: box.querySelector('.face.back'),
+        left: box.querySelector('.face.left'),
+        top: box.querySelector('.face.top'),
+        bottom: box.querySelector('.face.bottom')
+      };
+
+      // reset faces
+      Object.values(faces).forEach(f=>{ f.style.background='linear-gradient(180deg,#fff,#eee)'; f.style.boxShadow='none'; f.style.borderColor='rgba(0,0,0,0.12)'; });
+
+      if (e1 !== '' && !isNaN(parseFloat(e1))) { faces.front.style.background = color; faces.front.style.boxShadow='0 0 12px rgba(0,0,0,0.12) inset'; }
+      if (e2 !== '' && !isNaN(parseFloat(e2))) { faces.right.style.background = color; faces.right.style.boxShadow='0 0 12px rgba(0,0,0,0.12) inset'; }
+      if (e3 !== '' && !isNaN(parseFloat(e3))) { faces.back.style.background = color; faces.back.style.boxShadow='0 0 12px rgba(0,0,0,0.12) inset'; }
+      if (e4 !== '' && !isNaN(parseFloat(e4))) { faces.left.style.background = color; faces.left.style.boxShadow='0 0 12px rgba(0,0,0,0.12) inset'; }
+
+      // label faces with edge values on hover/tap: add title attribute
+      faces.front.title = `Edge1: ${e1 || '—'}`;
+      faces.right.title = `Edge2: ${e2 || '—'}`;
+      faces.back.title = `Edge3: ${e3 || '—'}`;
+      faces.left.title = `Edge4: ${e4 || '—'}`;
+    }
+
+    function getColorForMaterial(material){
+      if(!material) return materialColorsDefault['default'];
+      const key = material.toLowerCase();
+      return materialColorsDefault[key] || materialColorsDefault['default'];
+    }
+
+    function setBoxDimensions(lengthMm, widthMm, depthMm){
+      // compute scale and px sizes
+      const maxFace = 220;
+      const l = Math.max(lengthMm,1), w = Math.max(widthMm,1), d = Math.max(depthMm,1);
+      const scale = Math.min(maxFace / l, maxFace / w, 2);
+      const lengthPx = Math.max(30, Math.round(l * scale));
+      const widthPx = Math.max(20, Math.round(w * scale));
+      const depthPx = Math.max(8, Math.round(d * scale));
+
+      box.style.setProperty('--length-half', (lengthPx/2) + 'px');
+      box.style.setProperty('--width-half', (widthPx/2) + 'px');
+      box.style.setProperty('--depth-half', (depthPx/2) + 'px');
+
+      // size faces using inline styles
+      const fFront = box.querySelector('.face.front');
+      const fBack  = box.querySelector('.face.back');
+      const fRight = box.querySelector('.face.right');
+      const fLeft  = box.querySelector('.face.left');
+      const fTop   = box.querySelector('.face.top');
+      const fBot   = box.querySelector('.face.bottom');
+
+      if(!fFront) return; // safety
+
+      [fFront, fBack].forEach(f=>{ f.style.width = lengthPx + 'px'; f.style.height = widthPx + 'px'; f.style.left = `calc(50% - ${lengthPx/2}px)`; f.style.top = `calc(50% - ${widthPx/2}px)`; });
+      [fRight, fLeft].forEach(f=>{ f.style.width = depthPx + 'px'; f.style.height = widthPx + 'px'; f.style.left = `calc(50% - ${depthPx/2}px)`; f.style.top = `calc(50% - ${widthPx/2}px)`; });
+      [fTop, fBot].forEach(f=>{ f.style.width = lengthPx + 'px'; f.style.height = depthPx + 'px'; f.style.left = `calc(50% - ${lengthPx/2}px)`; f.style.top = `calc(50% - ${depthPx/2}px)`; });
+
+      // give simple textual labels
+      fFront.textContent = `${lengthMm} x ${widthMm} mm`;
+      fRight.textContent = `Depth ${depthMm} mm`;
+      fTop.textContent = `${lengthMm} x ${depthMm} mm`;
+    }
+
+    function exportCSV(){
+      const rows = [...tableBody.querySelectorAll('tr')].map(tr => [...tr.querySelectorAll('input')].map(i=>i.value));
+      const csv = ['Material,Length,Width,Thickness,Edge1,Edge2,Edge3,Edge4', ...rows.map(r=>r.join(','))].join('\n');
+      const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
+      const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download='cutting_list.csv'; link.click();
+    }
+
+    function exportExcel(){
+      const headers = ['Material','Length','Width','Thickness','Edge1','Edge2','Edge3','Edge4'];
+      const rows = [headers];
+      document.querySelectorAll('#cuttingList tbody tr').forEach(tr=>{ const inputs = tr.querySelectorAll('input'); rows.push(Array.from(inputs).map(i=>i.value)); });
+      const ws = XLSX.utils.aoa_to_sheet(rows);
+      const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, 'CuttingList'); XLSX.writeFile(wb, 'cutting_list.xlsx');
+    }
+
+    // rotation + pinch zoom
+    let isDragging=false, lastX=0, lastY=0, rotX=20, rotY=-20, scale=1, startDist=0;
+
+    function updateRotation(dx,dy){ rotX += dy*0.4; rotY += dx*0.4; boxWrapper.style.transform = `rotateX(${rotX}deg) rotateY(${rotY}deg) scale(${scale})`; }
+
+    scene.addEventListener('mousedown', e=>{ isDragging=true; lastX=e.clientX; lastY=e.clientY; scene.style.cursor='grabbing'; });
+    window.addEventListener('mousemove', e=>{ if(!isDragging) return; const dx=e.clientX-lastX, dy=e.clientY-lastY; updateRotation(dx,dy); lastX=e.clientX; lastY=e.clientY; });
+    window.addEventListener('mouseup', ()=>{ isDragging=false; scene.style.cursor='grab'; });
+
+    // touch
+    scene.addEventListener('touchstart', e=>{
+      if(e.touches.length===1){ isDragging=true; lastX=e.touches[0].clientX; lastY=e.touches[0].clientY; }
+      else if(e.touches.length===2){ startDist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY); }
+    }, {passive:false});
+
+    scene.addEventListener('touchmove', e=>{
+      if(e.touches.length===1 && isDragging){ const dx=e.touches[0].clientX-lastX, dy=e.touches[0].clientY-lastY; updateRotation(dx,dy); lastX=e.touches[0].clientX; lastY=e.touches[0].clientY; }
+      else if(e.touches.length===2){ const newDist = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY); const diff = newDist - startDist; scale = Math.max(0.4, Math.min(2.5, scale + diff*0.002)); boxWrapper.style.transform = `rotateX(${rotX}deg) rotateY(${rotY}deg) scale(${scale})`; startDist=newDist; }
+    }, {passive:false});
+
+    scene.addEventListener('touchend', ()=>{ isDragging=false; startDist=0; });
+
+    // Legend building
+    function rebuildLegend(){
+      const mats = {};
+      document.querySelectorAll('#cuttingList tbody tr').forEach(tr=>{
+        const m = tr.querySelector('.material').value.trim(); if(!m) return; const key = m.toLowerCase(); mats[key] = getColorForMaterial(m);
+      });
+      materialLegend.innerHTML = '';
+      Object.keys(mats).forEach(k=>{
+        const div = document.createElement('div'); div.className='legend-item'; div.innerHTML = `<div class='color-box' style='background:${mats[k]}'></div><div style='font-size:13px'>${k}</div>`; materialLegend.appendChild(div);
+      });
+    }
+
+    // initial demo rows
+    addRow('MDF',1200,600,18,'1200','600','','');
+    addRow('Plywood',2400,1200,12,'2400','','1200','');
+    selectRow(0);
+  </script>
+</body>
+</html>
